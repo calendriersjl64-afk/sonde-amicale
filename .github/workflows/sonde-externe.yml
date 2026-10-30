@@ -1,0 +1,47 @@
+# À placer dans un dépôt GitHub PUBLIC, au chemin .github/workflows/sonde-externe.yml
+# Secret à créer dans le dépôt : Settings > Secrets and variables > Actions > PING_URL
+# (l'adresse hc-ping.com du check « sonde-externe »). Un secret reste masqué même en dépôt public.
+name: Sonde externe
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # GitHub peut retarder un passage : délai de grâce de 20 min dans Healthchecks.io
+  workflow_dispatch:          # bouton « Run workflow » pour tester à la main
+
+jobs:
+  sonde:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: API, certificat et page des reçus
+        env:
+          PING_URL: ${{ secrets.PING_URL }}
+        run: |
+          erreurs=""
+
+          # 1. L'API répond-elle depuis internet ? « No API key » = Supabase répond
+          corps=$(curl -s -m 20 https://api.hbconnexion.fr/auth/v1/health || true)
+          echo "$corps" | grep -q "No API key" || erreurs="$erreurs API : ${corps:0:200} ;"
+
+          # 2. Le certificat d'api.hbconnexion.fr expire-t-il dans moins de 14 jours ?
+          fin=$(echo | openssl s_client -servername api.hbconnexion.fr -connect api.hbconnexion.fr:443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          if [ -z "$fin" ]; then
+            erreurs="$erreurs certificat illisible ;"
+          else
+            jours=$(( ( $(date -d "$fin" +%s) - $(date +%s) ) / 86400 ))
+            echo "Certificat valable encore $jours jours"
+            [ "$jours" -ge 14 ] || erreurs="$erreurs certificat api expire dans $jours jours ;"
+          fi
+
+          # 3. La page des reçus (dashboard sur Vercel) répond-elle ?
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 https://recu.hbconnexion.fr/ || true)
+          [ "$code" = "200" ] || erreurs="$erreurs recu.hbconnexion.fr HTTP $code ;"
+
+          if [ -z "$erreurs" ]; then
+            echo "Tout est OK"
+            curl -fsS -m 10 --retry 3 "$PING_URL" >/dev/null
+          else
+            echo "Problème : $erreurs"
+            curl -fsS -m 10 --retry 3 --data-raw "$erreurs" "$PING_URL/fail" >/dev/null
+            exit 1
+          fi
